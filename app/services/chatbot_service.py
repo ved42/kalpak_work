@@ -4,58 +4,46 @@ from app.services.validator import validate_sql
 from app.services.optimizer import optimize_sql
 from app.services.rag_service import get_schema_info
 from app.prompts import CHATBOT_CONTEXT_PROMPT
-from app.config import genai
+from app.config import generate
+from app.services.memory_service import save_message, get_last_messages, init_db
 
-import pandas as pd
-from io import BytesIO
-from tabulate import tabulate
+# Initialize DB when service starts
+init_db()
 
-session_context = {}
+def process_user_query(session_id: str, query: str) -> dict:
+    # Save query in memory
+    save_message(session_id, query)
 
+    # Get last 10 messages for context
+    history = get_last_messages(session_id, 10)
+    conversation_history = "\n".join([f"User: {q}" for q in history])
 
-def process_user_query(session_id: str, query: str, uploaded_file: bytes = None) -> str:
-    if session_id not in session_context:
-        session_context[session_id] = []
+    # Context-aware filtering
+    context_prompt = CHATBOT_CONTEXT_PROMPT.format(
+        conversation_history=conversation_history,
+        user_input=query
+    )
+    context_response = (generate(context_prompt) or "").strip()
 
-    session_context[session_id].append(query)
+    # Reject irrelevant queries
+    if "assist only with data queries" in context_response.lower():
+        return {"sql_query": None, "explanation": context_response}
 
-    context_prompt = CHATBOT_CONTEXT_PROMPT.format(user_input=query)
-    context_response = genai.generate(prompt=context_prompt, model="gemini-1.5-flash").result.strip()
-    if "assist only with data queries" in context_response:
-        return "I'm designed to assist only with data queries related to enterprise databases."
-
+    # Handle explicit "explain" queries
     if "explain" in query.lower():
-        return "This SQL query retrieves specific columns based on user input."
+        explanation = f"This SQL query is designed to retrieve relevant columns or rows efficiently.\n\nContext:\n{query}"
+        return {"sql_query": None, "explanation": explanation}
 
+    # Run NL2SQL pipeline
     rephrased = rephrase_query(query)
+    schema_info = get_schema_info()
+    sql_query = generate_sql(rephrased, schema_info, conversation_history)
 
-    if uploaded_file:
-        df = pd.read_csv(BytesIO(uploaded_file))
-        schema_info = "Table: uploaded_data (" + ", ".join(df.columns) + ")"
-        sql_query = generate_sql(rephrased, schema_info)
+    # Validate SQL
+    if not validate_sql(sql_query):
+        return {"sql_query": None, "explanation": "Generated SQL is invalid."}
 
-        if not validate_sql(sql_query):
-            return "Error: Generated SQL is invalid."
+    # Optimize SQL
+    optimized_sql = optimize_sql(sql_query)
 
-        optimized_sql = optimize_sql(sql_query)
-
-        try:
-            import pandasql
-            extracted_data = pandasql.sqldf(optimized_sql, {"uploaded_data": df})
-            table_text = tabulate(extracted_data, headers='keys', tablefmt='grid')
-        except Exception as e:
-            table_text = f"Error executing query: {str(e)}"
-
-        response_text = f"SQL Query:\n{optimized_sql}\n\nExtracted Data:\n{table_text}"
-        return response_text
-
-    else:
-        schema_info = get_schema_info()
-        sql_query = generate_sql(rephrased, schema_info)
-
-        if not validate_sql(sql_query):
-            return "Error: Generated SQL is invalid."
-
-        optimized_sql = optimize_sql(sql_query)
-
-        return optimized_sql
+    return {"sql_query": optimized_sql, "explanation": None}
